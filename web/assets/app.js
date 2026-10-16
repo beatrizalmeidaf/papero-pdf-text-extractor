@@ -1,4 +1,5 @@
 import { renderCompare, renderFidelity } from "./compare.js";
+import { createEditor } from "./editor.js";
 import { captionText, extractDocument, openPdf } from "./engine.js";
 import { assess, referenceItems } from "./fidelity.js";
 import { applyStatic, lang, setLang, t as tr } from "./i18n.js";
@@ -13,7 +14,11 @@ const store = {
   set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
 };
 
-const state = { file: null, data: null, doc: null, pdf: null, hidden: new Set(["header", "footer", "page_number"]), selected: null, fidelity: null, hasReference: false, diffDirty: false };
+const state = {
+  file: null, data: null, doc: null, pdf: null, hidden: new Set(["header", "footer", "page_number"]), selected: null,
+  fidelity: null, hasReference: false, reference: null, diffDirty: false,
+  edit: false, selection: [], // layout editor: on/off, the selected blocks
+};
 
 // ---------------------------------------------------------------- small UI helpers
 let toastTimer;
@@ -159,6 +164,8 @@ async function run() {
     }
     state.doc = doc;
     state.selected = null;
+    state.selection = [];
+    editor.reset();
     state.fidelity = await assessDocument(doc);
     render();
   } catch (e) {
@@ -178,6 +185,7 @@ async function assessDocument(doc) {
     try { reference = await referenceItems(state.pdf, doc.pages.map((p) => p.number)); } catch { /* structure only */ }
   }
   state.hasReference = !!reference;
+  state.reference = reference;
   return assess(doc, reference, captionText);
 }
 
@@ -205,6 +213,25 @@ async function extractOnServer(opts) {
 function render() {
   const doc = state.doc;
   const blocks = doc.pages.flatMap((p) => p.blocks);
+  const tables = tablesOf(doc), images = imagesOf(doc);
+  renderStats();
+  $("#copy-btn").disabled = false;
+  $("#export-btn").disabled = false;
+  $("#empty").hidden = true;
+  $("#viewer").hidden = false;
+  renderLegend(blocks);
+  renderPages();
+  renderMarkdown();
+  renderTables(tables);
+  renderGallery(images);
+  $("#text-out").textContent = toText(doc, { math: mathMode() });
+  $("#json-out").textContent = toJson(doc, { embedImages: false });
+  showInspector(null);
+}
+
+function renderStats() {
+  const doc = state.doc;
+  const blocks = doc.pages.flatMap((p) => p.blocks);
   const count = (t) => blocks.filter((b) => b.type === t).length;
   const tables = tablesOf(doc), images = imagesOf(doc);
   $("#n-tables").textContent = tables.length;
@@ -228,18 +255,6 @@ function render() {
   $("#fid-chip").addEventListener("click", () => switchTab("diff"));
   state.diffDirty = true;
   if (!$("#view-diff").hidden) renderDiff();
-  $("#copy-btn").disabled = false;
-  $("#export-btn").disabled = false;
-  $("#empty").hidden = true;
-  $("#viewer").hidden = false;
-  renderLegend(blocks);
-  renderPages();
-  renderMarkdown();
-  renderTables(tables);
-  renderGallery(images);
-  $("#text-out").textContent = toText(doc, { math: mathMode() });
-  $("#json-out").textContent = toJson(doc, { embedImages: false });
-  showInspector(null);
 }
 
 function renderLegend(blocks) {
@@ -282,26 +297,49 @@ function renderPages() {
     wrap.dataset.page = page.number;
     wrap.dataset.scale = scale;
     wrap.innerHTML = `<span class="page-label">p. ${page.number}</span>`;
-    for (const b of page.blocks) {
-      if (!b.bbox || !page.width) continue;
-      const [x0, y0, x1, y1] = b.bbox;
-      const el = document.createElement("button");
-      el.type = "button";
-      el.className = "box";
-      el.dataset.type = b.type;
-      el.dataset.id = b.id;
-      el.hidden = state.hidden.has(b.type);
-      el.style.cssText = `--c:${typeColor(b.type)};left:${x0 * scale - 1}px;top:${y0 * scale}px;width:${(x1 - x0) * scale + 2}px;height:${(y1 - y0) * scale}px`;
-      el.setAttribute("aria-label", `${TYPE_LABEL[b.type] || b.type}: ${(b.text || "").slice(0, 80)}`);
-      el.innerHTML = `<span class="tag">${TYPE_LABEL[b.type] || b.type}${b.level ? " " + b.level : ""}</span>`;
-      el.addEventListener("click", () => select(b, el));
-      wrap.append(el);
-    }
+    paintBoxes(wrap, page);
     list.append(wrap);
     observer.observe(wrap);
   }
   if (!state.doc.pages.some((p) => p.width)) {
     list.innerHTML = `<p class="hint">${tr("no.positions")}</p>`;
+  }
+  markSelection();
+}
+
+// The block outlines of one page (its drawing stays).
+function paintBoxes(wrap, page) {
+  wrap.querySelectorAll(".box").forEach((el) => el.remove());
+  if (!page.width) return;
+  const scale = parseFloat(wrap.dataset.scale);
+  page.blocks.forEach((b, n) => {
+    if (!b.bbox) return;
+    const [x0, y0, x1, y1] = b.bbox;
+    const el = document.createElement("button");
+    el.type = "button";
+    el.className = "box" + (b.edited ? " edited" : "");
+    el.dataset.type = b.type;
+    el.dataset.id = b.id;
+    el.hidden = state.hidden.has(b.type);
+    el.style.cssText = `--c:${typeColor(b.type)};left:${x0 * scale - 1}px;top:${y0 * scale}px;width:${(x1 - x0) * scale + 2}px;height:${(y1 - y0) * scale}px`;
+    el.setAttribute("aria-label", `${TYPE_LABEL[b.type] || b.type}: ${(b.text || "").slice(0, 80)}`);
+    el.innerHTML = `<span class="tag">${TYPE_LABEL[b.type] || b.type}${b.level ? " " + b.level : ""}</span><span class="order">${n + 1}</span>`;
+    el.addEventListener("click", () => { if (!state.edit) select(b, el); });
+    wrap.append(el);
+  });
+}
+
+// Selected boxes marked; in the editor, the single selected one gets its resize handles.
+function markSelection() {
+  const ids = new Set(state.selection.map((b) => b.id));
+  document.querySelectorAll("#pages-list .handle").forEach((h) => h.remove());
+  document.querySelectorAll("#pages-list .box").forEach((el) => el.classList.toggle("sel", ids.has(el.dataset.id)));
+  if (state.edit && state.selection.length === 1) {
+    const el = document.querySelector(`#pages-list .box[data-id="${state.selection[0].id}"]`);
+    if (el) {
+      el.hidden = false;
+      el.insertAdjacentHTML("beforeend", editor.HANDLES.map((h) => `<i class="handle" data-h="${h}"></i>`).join(""));
+    }
   }
 }
 
@@ -320,15 +358,19 @@ async function paintPage(wrap) {
   await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 }
 
-function select(block, el) {
-  document.querySelectorAll(".box.sel").forEach((x) => x.classList.remove("sel"));
-  el?.classList.add("sel");
+function select(block) {
+  state.selection = block ? [block] : [];
   state.selected = block;
+  markSelection();
   showInspector(block);
 }
 
 function showInspector(b) {
   const box = $("#inspector");
+  if (state.edit) {
+    editor.renderInspector(box);
+    return;
+  }
   if (!b) {
     box.innerHTML = `<h3>${tr("inspector.title")}</h3><p class="hint">${tr("inspector.hint")}</p>`;
     return;
@@ -355,9 +397,11 @@ function showInspector(b) {
 
 function renderMarkdown() {
   const math = mathMode();
-  const md = toMarkdown(state.doc, { images: "embed", math });
   $("#md-source").textContent = toMarkdown(state.doc, { images: "ref", math });
-  const target = $("#md-rendered");
+  renderMd($("#md-rendered"), toMarkdown(state.doc, { images: "embed", math }), math);
+}
+
+function renderMd(target, md, math = mathMode()) {
   if (window.marked && window.DOMPurify) {
     // $$…$$ blocks are swapped for placeholders so Markdown can't mangle the LaTeX
     // (a "_" would become italics), then KaTeX renders them after sanitizing.
@@ -470,9 +514,68 @@ function jumpTo(block) {
   if (el) {
     el.hidden = false;
     el.scrollIntoView({ behavior: "smooth", block: "center" });
-    select(block, el);
+    select(block);
   }
 }
+
+// ---------------------------------------------------------------- layout editor
+const editor = createEditor({
+  state,
+  list: $("#pages-list"),
+  tr,
+  types: TYPES,
+  typeLabel: (type) => TYPE_LABEL[type] || type,
+  typeColor,
+  mathMode,
+  toast,
+  renderMd: (el, md) => renderMd(el, md),
+  onSelect() {
+    state.selected = state.selection[0] || null;
+    markSelection();
+    showInspector(state.selected);
+  },
+  onEdited(pageNumbers, { typing = false } = {}) {
+    for (const n of pageNumbers) {
+      const wrap = document.querySelector(`#pages-list .page-wrap[data-page="${n}"]`);
+      const page = state.doc.pages.find((p) => p.number === n);
+      if (wrap && page) paintBoxes(wrap, page);
+    }
+    markSelection();
+    if (!typing) showInspector(state.selected);
+    scheduleViews();
+  },
+  onBusy: (on) => $("#inspector").classList.toggle("busy", on),
+});
+
+// The other views follow the edits, a moment after the last one.
+let viewsTimer;
+function scheduleViews() {
+  clearTimeout(viewsTimer);
+  viewsTimer = setTimeout(() => {
+    const doc = state.doc;
+    state.fidelity = assess(doc, state.reference, captionText);
+    renderStats();
+    renderLegend(doc.pages.flatMap((p) => p.blocks));
+    renderMarkdown();
+    renderTables(tablesOf(doc));
+    renderGallery(imagesOf(doc));
+    $("#text-out").textContent = toText(doc, { math: mathMode() });
+    $("#json-out").textContent = toJson(doc, { embedImages: false });
+  }, 250);
+}
+
+const editBtn = $("#edit-btn");
+function setEditing(on) {
+  state.edit = on;
+  editBtn.setAttribute("aria-pressed", String(on));
+  editBtn.querySelector("span").textContent = tr(on ? "edit.done" : "edit.toggle");
+  $("#pages-list").classList.toggle("editing", on);
+  if (on) document.querySelectorAll("#pages-list .box").forEach((el) => (el.hidden = state.hidden.has(el.dataset.type)));
+  markSelection();
+  showInspector(state.selected);
+}
+editBtn.addEventListener("click", () => setEditing(!state.edit));
+addEventListener("beforeunload", (e) => { if (editor.dirty) e.preventDefault(); });
 
 // ---------------------------------------------------------------- tabs, copy, export
 function switchTab(view) {
@@ -507,6 +610,7 @@ langBtn.addEventListener("click", () => {
   syncEngine();
   renderExportMenu();
   if (state.doc) render(); // re-label legend, stats, tables and inspector
+  editBtn.querySelector("span").textContent = tr(state.edit ? "edit.done" : "edit.toggle");
 });
 $("#export-btn").addEventListener("click", (e) => {
   e.stopPropagation();
@@ -540,9 +644,7 @@ new ResizeObserver(([entry]) => {
   lastWidth = w;
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    const id = state.selected?.id;
     renderPages();
-    if (id) document.querySelector(`.box[data-id="${id}"]`)?.classList.add("sel");
   }, 150);
 }).observe($("#pages-list"));
 
