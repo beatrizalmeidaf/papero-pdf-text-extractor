@@ -181,6 +181,8 @@ The report checks every document against its own PDF — no ground truth, so rea
 
 The browser app runs the same checks on the PDF you drop: the fidelity figure sits next to the page count, and the **Compare** tab puts each page beside what was extracted from it, marking the PDF text that is not in the output and the blocks that failed a check.
 
+When a page still comes out wrong, **Fix layout** (Pages tab) lets you correct it on the page: drag a block to move it, pull its handles to resize it, draw a new one on an empty spot, change its type (a paragraph that should be a table, a formula that is a list item), merge several, delete them or move them in the reading order — with undo/redo. Each time a block's region changes, its content is read again from the PDF exactly as the extraction reads it; the panel beside shows the page's Markdown live, and every view and export (Markdown, Word, Excel, JSON…) comes out with the fixes.
+
 ```python
 from papero_extract import extract
 from papero_extract.batch import run_batch
