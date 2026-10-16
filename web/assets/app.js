@@ -1,4 +1,4 @@
-import { renderCompare, renderFidelity } from "./compare.js";
+import { refreshComparePage, renderCompare, renderFidelity } from "./compare.js";
 import { createEditor } from "./editor.js";
 import { captionText, extractDocument, openPdf } from "./engine.js";
 import { assess, referenceItems } from "./fidelity.js";
@@ -17,7 +17,7 @@ const store = {
 const state = {
   file: null, data: null, doc: null, pdf: null, hidden: new Set(["header", "footer", "page_number"]), selected: null,
   fidelity: null, hasReference: false, reference: null, diffDirty: false,
-  edit: false, selection: [], // layout editor: on/off, the selected blocks
+  selection: [], // the selected blocks (the layout editor works on them)
 };
 
 // ---------------------------------------------------------------- small UI helpers
@@ -324,23 +324,15 @@ function paintBoxes(wrap, page) {
     el.style.cssText = `--c:${typeColor(b.type)};left:${x0 * scale - 1}px;top:${y0 * scale}px;width:${(x1 - x0) * scale + 2}px;height:${(y1 - y0) * scale}px`;
     el.setAttribute("aria-label", `${TYPE_LABEL[b.type] || b.type}: ${(b.text || "").slice(0, 80)}`);
     el.innerHTML = `<span class="tag">${TYPE_LABEL[b.type] || b.type}${b.level ? " " + b.level : ""}</span><span class="order">${n + 1}</span>`;
-    el.addEventListener("click", () => { if (!state.edit) select(b, el); });
+    el.addEventListener("click", () => select(b));
     wrap.append(el);
   });
 }
 
-// Selected boxes marked; in the editor, the single selected one gets its resize handles.
+// The selected boxes marked on the Pages view.
 function markSelection() {
   const ids = new Set(state.selection.map((b) => b.id));
-  document.querySelectorAll("#pages-list .handle").forEach((h) => h.remove());
   document.querySelectorAll("#pages-list .box").forEach((el) => el.classList.toggle("sel", ids.has(el.dataset.id)));
-  if (state.edit && state.selection.length === 1) {
-    const el = document.querySelector(`#pages-list .box[data-id="${state.selection[0].id}"]`);
-    if (el) {
-      el.hidden = false;
-      el.insertAdjacentHTML("beforeend", editor.HANDLES.map((h) => `<i class="handle" data-h="${h}"></i>`).join(""));
-    }
-  }
 }
 
 async function paintPage(wrap) {
@@ -367,10 +359,6 @@ function select(block) {
 
 function showInspector(b) {
   const box = $("#inspector");
-  if (state.edit) {
-    editor.renderInspector(box);
-    return;
-  }
   if (!b) {
     box.innerHTML = `<h3>${tr("inspector.title")}</h3><p class="hint">${tr("inspector.hint")}</p>`;
     return;
@@ -496,16 +484,17 @@ function renderDiff() {
     hasReference: state.hasReference,
     onPage: (n) => document.querySelector(`.diff-row[data-page="${n}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" }),
   });
-  renderCompare($("#diff-list"), {
-    doc: state.doc,
-    pdf: state.pdf,
-    fidelity: state.fidelity,
-    onlyProblems: $("#diff-only").checked,
-    tr,
-    typeLabel: (type) => TYPE_LABEL[type] || type,
-    onSelect: jumpTo,
-  });
+  renderCompare($("#diff-list"), compareCtx());
 }
+const compareCtx = () => ({
+  doc: state.doc,
+  pdf: state.pdf,
+  fidelity: state.fidelity,
+  onlyProblems: $("#diff-only").checked,
+  tr,
+  typeLabel: (type) => TYPE_LABEL[type] || type,
+  onPainted: () => editor.decorate(),
+});
 $("#diff-only").addEventListener("change", renderDiff);
 
 function jumpTo(block) {
@@ -518,34 +507,42 @@ function jumpTo(block) {
   }
 }
 
-// ---------------------------------------------------------------- layout editor
+// ---------------------------------------------------------------- layout editor (on the Compare view)
 const editor = createEditor({
   state,
-  list: $("#pages-list"),
+  list: $("#diff-list"),
   tr,
   types: TYPES,
   typeLabel: (type) => TYPE_LABEL[type] || type,
-  typeColor,
-  mathMode,
   toast,
-  renderMd: (el, md) => renderMd(el, md),
+  isActive: () => !$("#view-diff").hidden,
   onSelect() {
     state.selected = state.selection[0] || null;
     markSelection();
     showInspector(state.selected);
   },
-  onEdited(pageNumbers, { typing = false } = {}) {
+  onEdited(pageNumbers) {
+    // The checks again first: a page's marks on the Compare view come from them.
+    state.fidelity = assess(state.doc, state.reference, captionText);
+    const ctx = compareCtx();
     for (const n of pageNumbers) {
-      const wrap = document.querySelector(`#pages-list .page-wrap[data-page="${n}"]`);
       const page = state.doc.pages.find((p) => p.number === n);
-      if (wrap && page) paintBoxes(wrap, page);
+      if (!page) continue;
+      refreshComparePage($("#diff-list"), page, ctx);
+      const wrap = document.querySelector(`#pages-list .page-wrap[data-page="${n}"]`);
+      if (wrap) paintBoxes(wrap, page);
     }
     markSelection();
-    if (!typing) showInspector(state.selected);
+    showInspector(state.selected);
     scheduleViews();
   },
-  onBusy: (on) => $("#inspector").classList.toggle("busy", on),
+  onHistory() {
+    $("#undo-btn").disabled = !editor.canUndo;
+    $("#redo-btn").disabled = !editor.canRedo;
+  },
 });
+$("#undo-btn").addEventListener("click", () => editor.undo());
+$("#redo-btn").addEventListener("click", () => editor.redo());
 
 // The other views follow the edits, a moment after the last one.
 let viewsTimer;
@@ -553,8 +550,12 @@ function scheduleViews() {
   clearTimeout(viewsTimer);
   viewsTimer = setTimeout(() => {
     const doc = state.doc;
-    state.fidelity = assess(doc, state.reference, captionText);
     renderStats();
+    renderFidelity($("#fidelity"), state.fidelity, {
+      tr,
+      hasReference: state.hasReference,
+      onPage: (n) => document.querySelector(`.diff-row[data-page="${n}"]`)?.scrollIntoView({ behavior: "smooth", block: "start" }),
+    });
     renderLegend(doc.pages.flatMap((p) => p.blocks));
     renderMarkdown();
     renderTables(tablesOf(doc));
@@ -564,17 +565,13 @@ function scheduleViews() {
   }, 250);
 }
 
-const editBtn = $("#edit-btn");
-function setEditing(on) {
-  state.edit = on;
-  editBtn.setAttribute("aria-pressed", String(on));
-  editBtn.querySelector("span").textContent = tr(on ? "edit.done" : "edit.toggle");
-  $("#pages-list").classList.toggle("editing", on);
-  if (on) document.querySelectorAll("#pages-list .box").forEach((el) => (el.hidden = state.hidden.has(el.dataset.type)));
-  markSelection();
-  showInspector(state.selected);
-}
-editBtn.addEventListener("click", () => setEditing(!state.edit));
+// The Pages view sends to the Compare view, where the layout is fixed.
+$("#edit-btn").addEventListener("click", () => {
+  switchTab("diff");
+  const id = state.selected?.id;
+  const ob = id && document.querySelector(`#diff-list .ob[data-id="${id}"]`);
+  (ob || $("#view-diff")).scrollIntoView({ behavior: "smooth", block: "center" });
+});
 addEventListener("beforeunload", (e) => { if (editor.dirty) e.preventDefault(); });
 
 // ---------------------------------------------------------------- tabs, copy, export
@@ -610,7 +607,7 @@ langBtn.addEventListener("click", () => {
   syncEngine();
   renderExportMenu();
   if (state.doc) render(); // re-label legend, stats, tables and inspector
-  editBtn.querySelector("span").textContent = tr(state.edit ? "edit.done" : "edit.toggle");
+  if (state.doc && !$("#view-diff").hidden) renderDiff();
 });
 $("#export-btn").addEventListener("click", (e) => {
   e.stopPropagation();

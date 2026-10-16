@@ -1,37 +1,40 @@
-// Layout editor: correct the extraction by hand, on the page. A block is moved, resized,
-// drawn, reclassified, merged with others, deleted or put elsewhere in the reading order;
-// whenever its region changes, its content is read again from the PDF the same way the
-// extraction reads it (engine.readRegion). Every other view and export works on the edited
-// document, so the Markdown and the Word file follow each change.
+// Layout editor, on the Compare view: the outline of every block sits over the PDF page and
+// is dragged, resized, drawn, reclassified, merged, deleted or put elsewhere in the reading
+// order right there; the papero output beside it follows while the pointer moves. Whenever a
+// block's region changes, its content is read again from the PDF the same way the extraction
+// reads it (engine.readRegion). A double click on the output fixes its text in place. Every
+// other view and export works on the edited document.
 
 import { cropRegion, pageGlyphs, readRegion } from "./engine.js";
-import { blockMarkdown, esc } from "./export.js";
+import { esc } from "./export.js";
+import { fillBlock, place } from "./compare.js";
 
 const HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 const MIN_SIZE = 4; // pt: a smaller box is a slip of the mouse
 const DRAG_START = 3; // px before a press becomes a drag
+const LIVE_EVERY = 90; // ms between two live readings while dragging
 const CONTENT = ["text", "rows", "latex", "number", "marker", "runs"];
 const IMAGE_TYPES = new Set(["figure", "table", "formula"]);
 const round = (v) => Math.round(v * 100) / 100;
 
 /**
  * @param {object} ctx
- *   state       the app state ({ doc, pdf, edit, selection })
- *   list        the element holding the page wraps (#pages-list)
- *   tr, types, typeLabel, typeColor
- *   onEdited(pageNumbers, { typing })  re-draw these pages and refresh the other views
- *   onSelect()  the selection changed: mark the boxes, show the inspector
- *   renderMd(element, markdown)        Markdown (with LaTeX) into an element
- *   mathMode()  "unicode" | "latex"
- *   toast(message, error)
+ *   state      the app state ({ doc, pdf, selection })
+ *   list       the Compare view's page list (#diff-list)
+ *   tr, types, typeLabel, toast
+ *   isActive() is the Compare view on screen (keyboard shortcuts apply)
+ *   onEdited(pageNumbers)  pages to draw again, views to refresh
+ *   onSelect() the selection changed
+ *   onHistory() undo/redo availability changed
  */
 export function createEditor(ctx) {
   const { state, list, tr } = ctx;
   const undoStack = [], redoStack = [];
-  const glyphCache = new Map();
+  const glyphCache = new Map(); // page number -> Promise(glyphs)
+  const glyphReady = new Map(); // page number -> glyphs, once read (for live previews)
   let queue = Promise.resolve();
-  let pending = 0;
   let cropCount = 0;
+  const reading = new Set(); // blocks being read again
 
   // ---------------------------------------------------------------- document helpers
   const pageOf = (block) => state.doc.pages.find((p) => p.blocks.includes(block));
@@ -43,13 +46,12 @@ export function createEditor(ctx) {
     const all = state.doc.pages.flatMap((p) => p.blocks);
     state.selection = ids.map((id) => all.find((b) => b.id === id)).filter(Boolean);
   };
+  const select = (blocks) => { state.selection = blocks; ctx.onSelect(); decorate(); };
+  const edited = (pages) => { ctx.onEdited(pages); ctx.onHistory?.(); decorate(); };
 
   // Work that reads the PDF is done one step at a time, in order.
   function enqueue(job) {
-    pending++;
-    ctx.onBusy?.(true);
-    queue = queue.then(job).catch((e) => { console.error(e); ctx.toast(e.message || String(e), true); })
-      .finally(() => { if (!--pending) ctx.onBusy?.(false); });
+    queue = queue.then(job).catch((e) => { console.error(e); ctx.toast(e.message || String(e), true); });
     return queue;
   }
 
@@ -59,6 +61,7 @@ export function createEditor(ctx) {
     undoStack.push(snapshot());
     if (undoStack.length > 200) undoStack.shift();
     redoStack.length = 0;
+    ctx.onHistory?.();
   }
   function travel(from, to) {
     const step = from.pop();
@@ -66,7 +69,7 @@ export function createEditor(ctx) {
     to.push(snapshot());
     state.doc.pages.forEach((p, i) => { p.blocks = step.pages[i].map((b) => ({ ...b })); });
     selectIds(step.selection);
-    ctx.onEdited(state.doc.pages.map((p) => p.number));
+    edited(state.doc.pages.map((p) => p.number));
     ctx.onSelect();
   }
   const undo = () => enqueue(() => travel(undoStack, redoStack));
@@ -75,28 +78,35 @@ export function createEditor(ctx) {
   // ---------------------------------------------------------------- reading the PDF again
   function glyphsOf(number) {
     if (!state.pdf) return Promise.resolve(null);
-    if (!glyphCache.has(number)) glyphCache.set(number, pageGlyphs(state.pdf, number).catch(() => null));
+    if (!glyphCache.has(number)) {
+      glyphCache.set(number, pageGlyphs(state.pdf, number).then((g) => { glyphReady.set(number, g); return g; }).catch(() => null));
+    }
     return glyphCache.get(number);
   }
 
-  // The block's content, read again from its region as its type.
   async function reread(block, page) {
-    const glyphs = await glyphsOf(page.number);
-    if (glyphs) {
-      const found = readRegion(glyphs, block.bbox, block.type);
-      for (const key of CONTENT) delete block[key];
-      for (const [key, value] of Object.entries(found)) if (value !== null && value !== undefined) block[key] = value;
-    } else {
-      convertWithoutPdf(block);
-    }
-    delete block.line_boxes;
-    if (block.type === "heading") block.level = block.level || 2;
-    else if (block.type !== "list_item") delete block.level;
-    if (state.pdf && (block.type === "figure" || (IMAGE_TYPES.has(block.type) && hasImages()))) {
-      const crop = await cropRegion(state.pdf, page.number, block.bbox);
-      if (crop) block.image = { name: `p${page.number}-${block.type}-e${++cropCount}.png`, mime: "image/png", ...crop };
-    } else if (!IMAGE_TYPES.has(block.type)) {
-      delete block.image;
+    reading.add(block);
+    decorate();
+    try {
+      const glyphs = await glyphsOf(page.number);
+      if (glyphs) {
+        const found = readRegion(glyphs, block.bbox, block.type);
+        for (const key of CONTENT) delete block[key];
+        for (const [key, value] of Object.entries(found)) if (value !== null && value !== undefined) block[key] = value;
+      } else {
+        convertWithoutPdf(block);
+      }
+      delete block.line_boxes;
+      if (block.type === "heading") block.level = block.level || 2;
+      else if (block.type !== "list_item") delete block.level;
+      if (state.pdf && (block.type === "figure" || (IMAGE_TYPES.has(block.type) && hasImages()))) {
+        const crop = await cropRegion(state.pdf, page.number, block.bbox);
+        if (crop) block.image = { name: `p${page.number}-${block.type}-e${++cropCount}.png`, mime: "image/png", ...crop };
+      } else if (!IMAGE_TYPES.has(block.type)) {
+        delete block.image;
+      }
+    } finally {
+      reading.delete(block);
     }
   }
 
@@ -116,35 +126,38 @@ export function createEditor(ctx) {
   }
 
   // ---------------------------------------------------------------- operations
-  function changed(block) { block.edited = true; }
+  function clamp(bbox, page) {
+    let [x0, y0, x1, y1] = bbox;
+    if (x1 < x0) [x0, x1] = [x1, x0];
+    if (y1 < y0) [y0, y1] = [y1, y0];
+    return [Math.max(0, x0), Math.max(0, y0), Math.min(page.width, x1), Math.min(page.height, y1)].map(round);
+  }
 
-  function setGeometry(block, bbox, recordIt = true) {
+  function setGeometry(block, bbox) {
     const page = pageOf(block);
-    if (!page) return;
-    if (recordIt) record();
+    record();
     block.bbox = clamp(bbox, page);
-    changed(block);
-    ctx.onEdited([page.number]);
-    return enqueue(async () => { await reread(block, page); ctx.onEdited([page.number]); ctx.onSelect(); });
+    block.edited = true;
+    edited([page.number]);
+    return enqueue(async () => { await reread(block, page); edited([page.number]); });
   }
 
   function setType(blocks, type) {
     record();
-    const pages = new Set();
+    const pages = new Set(blocks.map(pageOf));
     for (const b of blocks) {
       b.type = type;
       if (type === "heading") b.level = b.level && b.level <= 6 ? b.level : 2;
-      changed(b);
-      pages.add(pageOf(b));
+      b.edited = true;
     }
-    ctx.onEdited([...pages].map((p) => p.number));
+    edited([...pages].map((p) => p.number));
     return enqueue(async () => {
       for (const b of blocks) {
         const page = pageOf(b);
         if (page && b.bbox) await reread(b, page);
         else convertWithoutPdf(b);
       }
-      ctx.onEdited([...pages].map((p) => p.number));
+      edited([...pages].map((p) => p.number));
       ctx.onSelect();
     });
   }
@@ -152,13 +165,13 @@ export function createEditor(ctx) {
   function setLevel(block, level) {
     record();
     block.level = level;
-    changed(block);
-    ctx.onEdited([pageOf(block).number]);
+    block.edited = true;
+    edited([pageOf(block).number]);
   }
 
-  // Typed content. `recordIt`: false while the same field keeps being typed in.
-  function setContent(block, value, recordIt) {
-    if (recordIt) record();
+  // Typed content: text, LaTeX, or table rows ("a | b" per line).
+  function setContent(block, value) {
+    record();
     for (const key of ["runs", "line_boxes"]) delete block[key];
     if (block.type === "table") {
       block.rows = value.split("\n").filter((l) => l.trim()).map((l) => l.split("|").map((c) => c.trim()));
@@ -169,8 +182,8 @@ export function createEditor(ctx) {
     } else {
       block.text = value;
     }
-    changed(block);
-    ctx.onEdited([pageOf(block).number], { typing: true });
+    block.edited = true;
+    edited([pageOf(block).number]);
   }
 
   function remove(blocks) {
@@ -182,7 +195,7 @@ export function createEditor(ctx) {
       renumber(p);
     }
     state.selection = [];
-    ctx.onEdited([...pages].map((p) => p.number));
+    edited([...pages].map((p) => p.number));
     ctx.onSelect();
   }
 
@@ -197,25 +210,24 @@ export function createEditor(ctx) {
     record();
     const parts = [...blocks].sort((a, b) => page.blocks.indexOf(a) - page.blocks.indexOf(b));
     const [first, ...rest] = parts;
-    first.bbox = [0, 1, 2, 3].map((k) => (k < 2 ? Math.min : Math.max)(...parts.map((b) => b.bbox[k])));
-    first.bbox = first.bbox.map(round);
+    first.bbox = [0, 1, 2, 3].map((k) => (k < 2 ? Math.min : Math.max)(...parts.map((b) => b.bbox[k]))).map(round);
     if (!IMAGE_TYPES.has(first.type)) {
       first.text = parts.map((b) => (b.rows ? b.rows.map((r) => r.join(" ")).join(" ") : b.text || "").trim()).filter(Boolean).join(" ");
-      const runs = parts.flatMap((b, i) => [
-        ...(i ? [{ text: " ", bold: false, italic: false, script: null }] : []),
-        ...(b.runs || [{ text: (b.text || "").trim(), bold: false, italic: false, script: null }]),
-      ]);
-      if (parts.some((b) => b.runs)) first.runs = runs;
-      else delete first.runs;
+      if (parts.some((b) => b.runs)) {
+        first.runs = parts.flatMap((b, i) => [
+          ...(i ? [{ text: " ", bold: false, italic: false, script: null }] : []),
+          ...(b.runs || [{ text: (b.text || "").trim(), bold: false, italic: false, script: null }]),
+        ]);
+      } else delete first.runs;
       delete first.line_boxes;
     }
-    changed(first);
+    first.edited = true;
     page.blocks = page.blocks.filter((b) => !rest.includes(b));
     renumber(page);
     state.selection = [first];
-    ctx.onEdited([page.number]);
+    edited([page.number]);
     ctx.onSelect();
-    if (IMAGE_TYPES.has(first.type)) return enqueue(async () => { await reread(first, page); ctx.onEdited([page.number]); ctx.onSelect(); });
+    if (IMAGE_TYPES.has(first.type)) return enqueue(async () => { await reread(first, page); edited([page.number]); });
   }
 
   // A new block over a region drawn on the page, put in the reading order where it sits.
@@ -232,16 +244,15 @@ export function createEditor(ctx) {
     page.blocks.splice(at, 0, block);
     renumber(page);
     state.selection = [block];
-    ctx.onEdited([page.number]);
+    edited([page.number]);
     ctx.onSelect();
     return enqueue(async () => {
       await reread(block, page);
-      // Lines starting with a marker are list items; one short bold line, a heading.
       if (/^\s*([•◦▪‣●○■□–—*-]|\(?\d{1,3}[.)]|\(?[a-z][.)])\s/.test(block.text || "")) {
-        block.type = "list_item";
+        block.type = "list_item"; // a marker opens it
         await reread(block, page);
       }
-      ctx.onEdited([page.number]);
+      edited([page.number]);
       ctx.onSelect();
     });
   }
@@ -254,8 +265,8 @@ export function createEditor(ctx) {
     record();
     [page.blocks[i], page.blocks[j]] = [page.blocks[j], page.blocks[i]];
     renumber(page);
-    changed(block);
-    ctx.onEdited([page.number]);
+    block.edited = true;
+    edited([page.number]);
     ctx.onSelect();
   }
 
@@ -265,57 +276,162 @@ export function createEditor(ctx) {
     record();
     return enqueue(async () => {
       for (const b of blocks) await reread(b, pageOf(b));
-      ctx.onEdited([...new Set(blocks.map((b) => pageOf(b).number))]);
-      ctx.onSelect();
+      edited([...new Set(blocks.map((b) => pageOf(b).number))]);
     });
   }
 
-  function clamp(bbox, page) {
-    let [x0, y0, x1, y1] = bbox;
-    if (x1 < x0) [x0, x1] = [x1, x0];
-    if (y1 < y0) [y0, y1] = [y1, y0];
-    const w = page.width || 1e6, h = page.height || 1e6;
-    return [Math.max(0, x0), Math.max(0, y0), Math.min(w, x1), Math.min(h, y1)].map(round);
+  // ---------------------------------------------------------------- looks: selection, handles, toolbar
+  const rowOf = (n) => list.querySelector(`.diff-row[data-page="${n}"]`);
+  const outlineOf = (b) => list.querySelector(`.diff-pane.original .ob[data-id="${b.id}"]`);
+  const outputOf = (b) => list.querySelector(`.diff-pane.output .rb[data-id="${b.id}"]`);
+
+  function decorate() {
+    if (!state.doc) return;
+    const ids = new Set(selectedIds());
+    list.querySelectorAll(".handle, .ed-bar").forEach((el) => el.remove());
+    list.querySelectorAll(".ob, .rb").forEach((el) => {
+      el.classList.toggle("sel", ids.has(el.dataset.id));
+      el.classList.toggle("reading", [...reading].some((b) => b.id === el.dataset.id));
+    });
+    if (state.selection.length === 1) {
+      const ob = outlineOf(state.selection[0]);
+      ob?.insertAdjacentHTML("beforeend", HANDLES.map((h) => `<i class="handle" data-h="${h}"></i>`).join(""));
+    }
+    toolbar();
   }
 
-  // ---------------------------------------------------------------- pointer: move, resize, draw
+  // The tools for the selection, floating over the page, right above its first block.
+  function toolbar() {
+    const sel = state.selection;
+    if (!sel.length) return;
+    const b = sel[0];
+    const ob = outlineOf(b);
+    const panes = ob?.closest(".diff-panes");
+    if (!ob || !panes) return;
+    const sameType = sel.every((x) => x.type === b.type);
+    const bar = document.createElement("div");
+    bar.className = "ed-bar";
+    bar.innerHTML = `
+      <select data-act="type" title="${esc(tr("edit.type"))}" aria-label="${esc(tr("edit.type"))}">
+        ${sameType ? "" : `<option value="" selected>${esc(tr("edit.many", { n: sel.length }))}</option>`}
+        ${ctx.types.map((t) => `<option value="${t}" ${sameType && b.type === t ? "selected" : ""}>${esc(ctx.typeLabel(t))}</option>`).join("")}
+      </select>
+      ${sel.length === 1 && b.type === "heading" ? `<select data-act="level" title="${esc(tr("insp.level"))}" aria-label="${esc(tr("insp.level"))}">${[1, 2, 3, 4, 5, 6].map((n) => `<option value="${n}" ${b.level === n ? "selected" : ""}>H${n}</option>`).join("")}</select>` : ""}
+      ${sel.length > 1 ? `<button type="button" data-act="merge" title="${esc(tr("edit.mergeHint"))}">${icon("merge")}<span>${esc(tr("edit.merge", { n: sel.length }))}</span></button>` : ""}
+      ${sel.length === 1 && b.type !== "figure" ? `<button type="button" data-act="text" title="${esc(tr("edit.textHint"))}">${icon("text")}<span>${esc(tr("edit.text"))}</span></button>` : ""}
+      ${state.pdf ? `<button type="button" data-act="reread" title="${esc(tr("edit.rereadHint"))}">${icon("reread")}</button>` : ""}
+      ${sel.length === 1 ? `<button type="button" data-act="up" title="${esc(tr("edit.upHint"))}">${icon("up")}</button><button type="button" data-act="down" title="${esc(tr("edit.downHint"))}">${icon("down")}</button>` : ""}
+      <button type="button" data-act="delete" class="danger" title="${esc(tr("edit.deleteHint"))}">${icon("delete")}</button>`;
+    panes.append(bar);
+    // Above the block when there is room, below otherwise; never off the page sideways.
+    const r = ob.getBoundingClientRect(), p = panes.getBoundingClientRect();
+    const h = bar.offsetHeight, w = bar.offsetWidth;
+    const top = r.top - p.top - h - 8 >= 0 ? r.top - p.top - h - 8 : r.bottom - p.top + 8;
+    bar.style.top = `${top}px`;
+    bar.style.left = `${Math.max(0, Math.min(r.left - p.left, p.width - w))}px`;
+    const on = (act, ev, fn) => bar.querySelector(`[data-act="${act}"]`)?.addEventListener(ev, fn);
+    bar.addEventListener("pointerdown", (e) => e.stopPropagation());
+    on("type", "change", (e) => e.target.value && setType([...sel], e.target.value));
+    on("level", "change", (e) => setLevel(b, +e.target.value));
+    on("merge", "click", () => merge([...sel]));
+    on("text", "click", () => editText(b));
+    on("reread", "click", rereadSelected);
+    on("up", "click", () => shift(b, -1));
+    on("down", "click", () => shift(b, 1));
+    on("delete", "click", () => remove([...sel]));
+  }
+
+  // ---------------------------------------------------------------- the text, fixed in place
+  function editText(block, cell = null) {
+    const rb = outputOf(block);
+    if (!rb || block.type === "figure") return;
+    const body = rb.querySelector(".rb-body");
+    rb.classList.add("editing");
+    const done = (keep) => {
+      target.removeEventListener("keydown", onKey);
+      target.removeEventListener("blur", onBlur);
+      target.contentEditable = "false";
+      rb.classList.remove("editing");
+      if (!keep) { edited([pageOf(block).number]); return; }
+      if (block.type === "table") {
+        const rows = [...rb.querySelectorAll("tr")].map((tr_) => [...tr_.cells].map((c) => c.textContent.trim()));
+        setContent(block, rows.map((r) => r.join(" | ")).join("\n"));
+      } else {
+        const value = target.innerText.replace(/\n$/, "");
+        if (value !== original) setContent(block, value);
+        else edited([pageOf(block).number]);
+      }
+    };
+    let target = body, original;
+    if (block.type === "table") {
+      target = cell || rb.querySelector("td");
+      if (!target) return;
+      original = target.textContent;
+    } else {
+      original = block.type === "formula" ? block.latex || block.text || "" : block.text || "";
+      body.textContent = original; // the bare text: no marker, no rendered math
+    }
+    try { target.contentEditable = "plaintext-only"; } catch { target.contentEditable = "true"; }
+    if (target.contentEditable !== "plaintext-only") target.contentEditable = "true";
+    target.focus();
+    const range = document.createRange();
+    range.selectNodeContents(target);
+    getSelection().removeAllRanges();
+    getSelection().addRange(range);
+    const onKey = (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") { e.preventDefault(); done(false); }
+      else if (e.key === "Enter" && !e.shiftKey && block.type !== "code") { e.preventDefault(); target.blur(); }
+    };
+    const onBlur = () => done(true);
+    target.addEventListener("keydown", onKey);
+    target.addEventListener("blur", onBlur);
+  }
+
+  // ---------------------------------------------------------------- pointer
+  let live = 0;
+  // While a block is being moved or drawn, its output beside follows: the same place, and
+  // the content the region holds right now (read from the glyphs already at hand).
+  function preview(rb, block, bbox, page, scale) {
+    place(rb, bbox, scale);
+    const glyphs = glyphReady.get(page.number);
+    if (!glyphs || block.type === "figure" || performance.now() - live < LIVE_EVERY) return;
+    live = performance.now();
+    fillBlock(rb, { ...block, ...readRegion(glyphs, clamp(bbox, page), block.type), bbox }, scale, ctx.typeLabel);
+  }
+
   list.addEventListener("pointerdown", (e) => {
-    if (!state.edit || e.button !== 0) return;
-    const wrap = e.target.closest(".page-wrap");
-    if (!wrap) return;
-    const page = pageNumbered(+wrap.dataset.page);
+    if (!state.doc || e.button !== 0) return;
+    const rb = e.target.closest(".diff-pane.output .rb");
+    if (rb) { // the output: pick (Shift adds); a double click edits the text
+      if (rb.classList.contains("editing")) return;
+      const block = pageNumbered(+rb.closest(".diff-pane").dataset.page)?.blocks.find((b) => b.id === rb.dataset.id);
+      if (block) select(e.shiftKey ? toggle(block) : [block]);
+      return;
+    }
+    const pane = e.target.closest(".diff-pane.original");
+    if (!pane) return;
+    const page = pageNumbered(+pane.dataset.page);
     if (!page?.width) return;
-    const scale = +wrap.dataset.scale;
-    const rect = wrap.getBoundingClientRect();
+    glyphsOf(page.number); // so that the live preview has them
+    const scale = +pane.dataset.scale;
+    const row = pane.closest(".diff-row");
+    const rect = pane.getBoundingClientRect();
     const at = (ev) => [(ev.clientX - rect.left) / scale, (ev.clientY - rect.top) / scale];
     const start = at(e);
     const handle = e.target.closest(".handle")?.dataset.h;
-    const el = e.target.closest(".box");
-    const block = el && page.blocks.find((b) => b.id === el.dataset.id);
+    const ob = e.target.closest(".ob");
+    const block = ob && page.blocks.find((b) => b.id === ob.dataset.id);
     e.preventDefault();
-    wrap.setPointerCapture(e.pointerId);
-
-    let mode, ghost = null, moved = false;
+    if (block && e.shiftKey && !handle) { select(toggle(block)); return; }
+    if (block && (!state.selection.includes(block) || state.selection.length > 1)) select([block]);
+    if (!block && state.selection.length) select([]);
+    const mode = block ? (handle ? "resize" : "move") : "draw";
     const origin = block ? [...block.bbox] : null;
-    if (block && e.shiftKey && !handle) {
-      state.selection = state.selection.includes(block) ? state.selection.filter((b) => b !== block) : [...state.selection, block];
-      ctx.onSelect();
-      wrap.releasePointerCapture(e.pointerId);
-      return;
-    }
-    if (block) {
-      if (!state.selection.includes(block) || state.selection.length > 1) { state.selection = [block]; ctx.onSelect(); }
-      mode = handle ? "resize" : "move";
-    } else {
-      mode = "draw";
-      if (state.selection.length) { state.selection = []; ctx.onSelect(); }
-    }
-    const place = (node, [x0, y0, x1, y1]) => {
-      node.style.left = `${Math.min(x0, x1) * scale - 1}px`;
-      node.style.top = `${Math.min(y0, y1) * scale}px`;
-      node.style.width = `${Math.abs(x1 - x0) * scale + 2}px`;
-      node.style.height = `${Math.abs(y1 - y0) * scale}px`;
-    };
+    const output = block ? outputOf(block) : null;
+    let ghost = null, twin = null, moved = false, last = e;
+    pane.setPointerCapture(e.pointerId);
+
     const target = () => {
       const [px, py] = at(last);
       const dx = px - start[0], dy = py - start[1];
@@ -328,46 +444,84 @@ export function createEditor(ctx) {
       if (handle.includes("s")) y1 += dy;
       return [x0, y0, x1, y1];
     };
-    let last = e;
     const onMove = (ev) => {
       last = ev;
       if (!moved && Math.hypot(ev.clientX - e.clientX, ev.clientY - e.clientY) < DRAG_START) return;
-      moved = true;
-      if (mode === "draw" && !ghost) {
-        ghost = document.createElement("div");
-        ghost.className = "box drawing";
-        wrap.append(ghost);
+      if (!moved) {
+        moved = true;
+        row.classList.add("dragging");
+        list.querySelectorAll(".ed-bar").forEach((el) => el.remove());
+        if (mode === "draw") {
+          ghost = Object.assign(document.createElement("div"), { className: "ob drawing" });
+          twin = Object.assign(document.createElement("div"), { className: "rb drawing" });
+          twin.style.setProperty("--c", "var(--accent)");
+          pane.append(ghost);
+          row.querySelector(".diff-pane.output").append(twin);
+        } else {
+          ob.classList.add("moving");
+          output?.classList.add("moving");
+        }
       }
-      place(ghost || el, target());
+      const box = target();
+      place(ghost || ob, box, scale);
+      const shown = twin || output;
+      if (shown) preview(shown, block || { type: "paragraph" }, box, page, scale);
     };
     const onUp = () => {
-      wrap.removeEventListener("pointermove", onMove);
-      wrap.removeEventListener("pointerup", onUp);
-      wrap.removeEventListener("pointercancel", onUp);
+      pane.removeEventListener("pointermove", onMove);
+      pane.removeEventListener("pointerup", onUp);
+      pane.removeEventListener("pointercancel", onUp);
+      row.classList.remove("dragging");
       ghost?.remove();
-      if (!moved) return;
+      twin?.remove();
+      ob?.classList.remove("moving");
+      output?.classList.remove("moving");
+      if (!moved) { decorate(); return; }
       const [x0, y0, x1, y1] = target();
       const big = Math.abs(x1 - x0) >= MIN_SIZE && Math.abs(y1 - y0) >= MIN_SIZE;
       if (mode === "draw") { if (big) add(page, [x0, y0, x1, y1]); return; }
-      if (!big) { ctx.onEdited([page.number]); return; } // too small: put it back
+      if (!big || (x0 === origin[0] && y0 === origin[1] && x1 === origin[2] && y1 === origin[3])) { edited([page.number]); return; }
       setGeometry(block, [x0, y0, x1, y1]);
     };
-    wrap.addEventListener("pointermove", onMove);
-    wrap.addEventListener("pointerup", onUp);
-    wrap.addEventListener("pointercancel", onUp);
+    pane.addEventListener("pointermove", onMove);
+    pane.addEventListener("pointerup", onUp);
+    pane.addEventListener("pointercancel", onUp);
+  });
+  const toggle = (block) => (state.selection.includes(block) ? state.selection.filter((b) => b !== block) : [...state.selection, block]);
+
+  list.addEventListener("dblclick", (e) => {
+    const rb = e.target.closest(".diff-pane.output .rb");
+    const ob = e.target.closest(".diff-pane.original .ob");
+    const el = rb || ob;
+    if (!el || !state.doc) return;
+    const block = pageNumbered(+el.closest(".diff-pane").dataset.page)?.blocks.find((b) => b.id === el.dataset.id);
+    if (!block) return;
+    e.preventDefault();
+    select([block]);
+    editText(block, rb ? e.target.closest("td") : null);
+  });
+
+  // Hovering a block lights up its other half.
+  list.addEventListener("pointerover", (e) => {
+    const el = e.target.closest(".ob, .rb");
+    list.querySelectorAll(".hot").forEach((x) => x.classList.remove("hot"));
+    if (!el?.dataset.id) return;
+    const row = el.closest(".diff-row");
+    row?.querySelectorAll(`[data-id="${el.dataset.id}"]`).forEach((x) => x.classList.add("hot"));
   });
 
   // ---------------------------------------------------------------- keyboard
   let nudgeTimer = null, nudging = null;
   document.addEventListener("keydown", (e) => {
-    if (!state.edit || !state.doc) return;
+    if (!state.doc || !ctx.isActive()) return;
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable;
-    const mod = e.ctrlKey || e.metaKey;
-    if (mod && e.key.toLowerCase() === "z" && !typing) { e.preventDefault(); (e.shiftKey ? redo : undo)(); return; }
-    if (mod && e.key.toLowerCase() === "y" && !typing) { e.preventDefault(); redo(); return; }
     if (typing) return;
-    if ((e.key === "Delete" || e.key === "Backspace") && state.selection.length) { e.preventDefault(); remove(state.selection); return; }
-    if (e.key === "Escape" && state.selection.length) { state.selection = []; ctx.onSelect(); return; }
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && e.key.toLowerCase() === "z") { e.preventDefault(); (e.shiftKey ? redo : undo)(); return; }
+    if (mod && e.key.toLowerCase() === "y") { e.preventDefault(); redo(); return; }
+    if ((e.key === "Delete" || e.key === "Backspace") && state.selection.length) { e.preventDefault(); remove([...state.selection]); return; }
+    if (e.key === "Escape" && state.selection.length) { select([]); return; }
+    if (e.key === "Enter" && state.selection.length === 1) { e.preventDefault(); editText(state.selection[0]); return; }
     const arrows = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
     const block = state.selection.length === 1 ? state.selection[0] : null;
     if (arrows[e.key] && block?.bbox) {
@@ -377,108 +531,33 @@ export function createEditor(ctx) {
       if (nudging !== block) { record(); nudging = block; }
       const page = pageOf(block);
       block.bbox = clamp([block.bbox[0] + dx, block.bbox[1] + dy, block.bbox[2] + dx, block.bbox[3] + dy], page);
-      changed(block);
-      ctx.onEdited([page.number]);
-      ctx.onSelect();
+      block.edited = true;
+      edited([page.number]);
       clearTimeout(nudgeTimer);
-      nudgeTimer = setTimeout(() => { nudging = null; enqueue(async () => { await reread(block, page); ctx.onEdited([page.number]); ctx.onSelect(); }); }, 350);
+      nudgeTimer = setTimeout(() => { nudging = null; enqueue(async () => { await reread(block, page); edited([page.number]); }); }, 350);
     }
   });
 
-  // ---------------------------------------------------------------- inspector
-  let typingIn = null; // the block whose content is being typed (one undo step per field)
-  function renderInspector(box) {
-    const sel = state.selection;
-    const undoButtons = `<div class="ed-history">
-      <button type="button" class="btn small-btn" data-act="undo" ${undoStack.length ? "" : "disabled"} title="Ctrl+Z">↶ ${tr("edit.undo")}</button>
-      <button type="button" class="btn small-btn" data-act="redo" ${redoStack.length ? "" : "disabled"} title="Ctrl+Shift+Z">↷ ${tr("edit.redo")}</button></div>`;
-    if (!sel.length) {
-      box.innerHTML = `<h3>${tr("edit.title")}</h3>${undoButtons}<p class="hint">${tr("edit.help")}</p><p class="hint">${tr("edit.exports")}</p>`;
-      wire(box);
-      return;
-    }
-    const b = sel[0];
-    const typeOptions = ctx.types.map((t) => `<option value="${t}" ${sel.every((x) => x.type === t) ? "selected" : ""}>${esc(ctx.typeLabel(t))}</option>`).join("");
-    const head = `<h3><span class="type-dot" style="--c:${ctx.typeColor(b.type)}"></span>${sel.length > 1 ? tr("edit.many", { n: sel.length }) : esc(ctx.typeLabel(b.type))}${b.edited ? ` <span class="ed-flag">${tr("edit.edited")}</span>` : ""}</h3>`;
-    let fields = `<label class="ed-field"><span>${tr("edit.type")}</span><select data-act="type">${sel.length > 1 && !sel.every((x) => x.type === b.type) ? `<option value="" selected>—</option>` : ""}${typeOptions}</select></label>`;
-    if (sel.length === 1) {
-      if (b.type === "heading") {
-        fields += `<label class="ed-field"><span>${tr("insp.level")}</span><select data-act="level">${[1, 2, 3, 4, 5, 6].map((n) => `<option ${b.level === n ? "selected" : ""}>${n}</option>`).join("")}</select></label>`;
-      }
-      const value = b.type === "table" ? (b.rows || []).map((r) => r.join(" | ")).join("\n") : b.type === "formula" ? b.latex || b.text || "" : b.text || "";
-      const label = b.type === "table" ? tr("edit.cells") : b.type === "formula" ? "LaTeX" : tr("edit.text");
-      fields += `<label class="ed-field ed-wide"><span>${label}</span><textarea data-act="content" rows="${Math.min(12, Math.max(3, value.split("\n").length + 1))}" spellcheck="false">${esc(value)}</textarea></label>`;
-      if (b.type === "formula") fields += `<div class="ed-math" id="ed-math"></div>`;
-      if (b.image?.data) fields += `<img class="ed-crop" alt="${tr("insp.crop")}" src="data:${b.image.mime};base64,${b.image.data}">`;
-      fields += `<div class="kv"><span>id</span><b>${esc(b.id)}</b><span>bbox</span><b>${b.bbox ? b.bbox.map((v) => v.toFixed(1)).join(", ") : "—"}</b></div>`;
-    }
-    const actions = [
-      sel.length > 1 ? `<button type="button" class="btn small-btn" data-act="merge">${tr("edit.merge", { n: sel.length })}</button>` : "",
-      state.pdf ? `<button type="button" class="btn small-btn" data-act="reread" title="${esc(tr("edit.rereadHint"))}">${tr("edit.reread")}</button>` : "",
-      sel.length === 1 ? `<button type="button" class="btn small-btn" data-act="up" title="${esc(tr("edit.upHint"))}">↑ ${tr("edit.up")}</button><button type="button" class="btn small-btn" data-act="down" title="${esc(tr("edit.downHint"))}">↓ ${tr("edit.down")}</button>` : "",
-      `<button type="button" class="btn small-btn ed-danger" data-act="delete">${tr("edit.delete")}</button>`,
-    ].join("");
-    box.innerHTML = `${head}${undoButtons}<div class="ed-fields">${fields}</div><div class="ed-actions">${actions}</div>
-      <section class="ed-live"><h4>${tr("edit.live", { n: pageOf(b)?.number ?? "" })}</h4><div class="ed-preview prose" id="ed-preview"></div></section>`;
-    wire(box);
-    renderPreview(box);
-    if (b.type === "formula" && sel.length === 1) renderMath(box, b.latex || b.text || "");
-  }
-
-  function renderMath(box, tex) {
-    const el = box.querySelector("#ed-math");
-    if (el && window.katex) { try { window.katex.render(tex, el, { displayMode: true, throwOnError: false }); } catch { el.textContent = tex; } }
-  }
-
-  // The page being edited as Markdown, block by block, the selected ones marked.
-  function renderPreview(box) {
-    const el = box.querySelector("#ed-preview");
-    const page = state.selection.length && pageOf(state.selection[0]);
-    if (!el || !page) return;
-    const ids = new Set(selectedIds());
-    el.innerHTML = "";
-    for (const b of page.blocks) {
-      if (["header", "footer", "page_number"].includes(b.type)) continue;
-      const md = blockMarkdown(b, "embed", ctx.mathMode());
-      if (!md.trim()) continue;
-      const part = document.createElement("div");
-      part.className = "ed-part" + (ids.has(b.id) ? " on" : "");
-      part.dataset.id = b.id;
-      ctx.renderMd(part, md);
-      part.addEventListener("click", () => { state.selection = [b]; ctx.onSelect(); });
-      el.append(part);
-    }
-    el.querySelector(".ed-part.on")?.scrollIntoView({ block: "nearest" });
-  }
-
-  function wire(box) {
-    const on = (act, ev, fn) => box.querySelector(`[data-act="${act}"]`)?.addEventListener(ev, fn);
-    on("undo", "click", undo);
-    on("redo", "click", redo);
-    on("type", "change", (e) => e.target.value && setType([...state.selection], e.target.value));
-    on("level", "change", (e) => setLevel(state.selection[0], +e.target.value));
-    on("merge", "click", () => merge([...state.selection]));
-    on("delete", "click", () => remove([...state.selection]));
-    on("reread", "click", rereadSelected);
-    on("up", "click", () => shift(state.selection[0], -1));
-    on("down", "click", () => shift(state.selection[0], 1));
-    on("content", "input", (e) => {
-      const b = state.selection[0];
-      setContent(b, e.target.value, typingIn !== b);
-      typingIn = b;
-      if (b.type === "formula") renderMath(box, e.target.value);
-      renderPreview(box);
-    });
-    on("content", "blur", () => { typingIn = null; });
-  }
-
   return {
-    renderInspector,
+    decorate,
     undo,
     redo,
     get canUndo() { return undoStack.length > 0; },
+    get canRedo() { return redoStack.length > 0; },
     get dirty() { return undoStack.length > 0; },
-    reset() { undoStack.length = 0; redoStack.length = 0; glyphCache.clear(); },
-    HANDLES,
+    reset() { undoStack.length = 0; redoStack.length = 0; glyphCache.clear(); glyphReady.clear(); ctx.onHistory?.(); },
   };
+}
+
+// Small line icons for the toolbar.
+function icon(name) {
+  const paths = {
+    merge: '<path d="M8 6h8M8 12h8M8 18h8"/><path d="M4 6v12"/>',
+    text: '<path d="M4 7V5h16v2"/><path d="M12 5v14"/><path d="M9 19h6"/>',
+    reread: '<path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/>',
+    up: '<path d="m6 15 6-6 6 6"/>',
+    down: '<path d="m6 9 6 6 6-6"/>',
+    delete: '<path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 13h10l1-13"/><path d="M9 7V4h6v3"/>',
+  };
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name]}</svg>`;
 }
