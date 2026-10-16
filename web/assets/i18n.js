@@ -47,6 +47,17 @@ const STRINGS = {
     "tabs.images": "Imagens",
     "tabs.text": "Texto",
     "tabs.diff": "Comparar",
+    "edit.toggle": "Corrigir layout", "edit.done": "Concluir correção",
+    "edit.barHint": "Mova, redimensione, reclassifique ou mescle os blocos; o Markdown e as exportações acompanham.",
+    "edit.title": "Corrigir o layout",
+    "edit.help": "Clique num bloco para escolhê-lo. Arraste-o para mover e puxe as alças para redimensionar; o conteúdo é lido de novo do PDF. Arraste numa área vazia da página para criar um bloco. Shift+clique escolhe vários (para mesclar). Delete exclui, as setas ajustam 1 pt (Shift: 10), Ctrl+Z desfaz.",
+    "edit.exports": "O Markdown, o texto, o JSON e as exportações (Word, Excel, ZIP…) já saem com as correções.",
+    "edit.undo": "Desfazer", "edit.redo": "Refazer", "edit.many": "{n} blocos", "edit.edited": "corrigido",
+    "edit.type": "Tipo", "edit.text": "Texto", "edit.cells": "Células (uma linha por linha, | entre colunas)",
+    "edit.merge": "Mesclar {n}", "edit.reread": "Reler do PDF", "edit.rereadHint": "Ler de novo, do PDF, o conteúdo da região deste bloco",
+    "edit.up": "Antes", "edit.upHint": "Uma posição antes na ordem de leitura", "edit.down": "Depois", "edit.downHint": "Uma posição depois na ordem de leitura",
+    "edit.delete": "Excluir", "edit.live": "Markdown ao vivo · p. {n}",
+    "edit.mergePages": "Só dá para mesclar blocos da mesma página.",
     "stats.fidelity": "fidelidade",
     "fid.title": "Fidelidade estimada",
     "fid.note": "Verificações do que foi extraído contra o próprio PDF, sem gabarito: mostram onde olhar, não são acurácia.",
@@ -165,6 +176,17 @@ const STRINGS = {
     "tabs.images": "Images",
     "tabs.text": "Text",
     "tabs.diff": "Compare",
+    "edit.toggle": "Fix layout", "edit.done": "Done fixing",
+    "edit.barHint": "Move, resize, reclassify or merge the blocks; the Markdown and the exports follow.",
+    "edit.title": "Fix the layout",
+    "edit.help": "Click a block to pick it. Drag it to move it and pull its handles to resize it; its content is read again from the PDF. Drag on an empty part of the page to draw a new block. Shift+click picks several (to merge them). Delete removes, the arrow keys nudge by 1 pt (Shift: 10), Ctrl+Z undoes.",
+    "edit.exports": "The Markdown, text, JSON and the exports (Word, Excel, ZIP…) come out with your fixes.",
+    "edit.undo": "Undo", "edit.redo": "Redo", "edit.many": "{n} blocks", "edit.edited": "fixed",
+    "edit.type": "Type", "edit.text": "Text", "edit.cells": "Cells (one line per row, | between columns)",
+    "edit.merge": "Merge {n}", "edit.reread": "Read from PDF", "edit.rereadHint": "Read this block's region from the PDF again",
+    "edit.up": "Earlier", "edit.upHint": "One place earlier in the reading order", "edit.down": "Later", "edit.downHint": "One place later in the reading order",
+    "edit.delete": "Delete", "edit.live": "Live Markdown · p. {n}",
+    "edit.mergePages": "Only blocks of the same page can be merged.",
     "stats.fidelity": "fidelity",
     "fid.title": "Estimated fidelity",
     "fid.note": "Checks of what was extracted against the PDF itself, with no ground truth: they show where to look, they are not accuracy.",
@@ -255,7 +277,7 @@ export let lang = initialLang();
 
 export function t(key, vars = {}) {
   const s = STRINGS[lang][key] ?? STRINGS.pt[key] ?? key;
-  return s.replace(/\{(\w+)\}/g, (_, k) => vars[k] ?? "");
+  return s.replace(/\{(\w+)\}/g, (m, k) => vars[k] ?? m); // ("{2}" in a LaTeX example is not a slot)
 }
 
 export function applyStatic(root = document) {
