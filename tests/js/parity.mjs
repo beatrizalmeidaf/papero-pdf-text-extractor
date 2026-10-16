@@ -12,7 +12,7 @@ const src = readFileSync(join(here, "../../web/assets/engine.js"), "utf8")
   .replace(/"\.\/(\w+\.js)"/g, (_, f) => JSON.stringify(pathToFileURL(join(here, "../../web/assets", f)).href));
 const enginePath = join(here, ".engine.node.mjs");
 writeFileSync(enginePath, src);
-const { extractDocument, captionText } = await import(pathToFileURL(enginePath).href);
+const { extractDocument, captionText, pageGlyphs, readRegion } = await import(pathToFileURL(enginePath).href);
 const { assess, referenceItems } = await import(pathToFileURL(join(here, "../../web/assets/fidelity.js")).href);
 
 // The fidelity report (web/assets/fidelity.js against fidelity.py): same verdict, same issues,
@@ -71,6 +71,21 @@ for (const name of ["structured", "hard", "declaration", "exam"]) {
   python: ${pyFid}
   js:     ${jsFid}`);
   } else console.log(`✓ ${name} fidelity: ${JSON.parse(jsFid).status}`);
+  // The layout editor reads a region again the way the extraction read it: every block's own
+  // region, read as its own type, gives back the block's content.
+  let reread = 0;
+  for (const page of doc.pages) {
+    const glyphs = await pageGlyphs(pdf, page.number);
+    for (const b of page.blocks) {
+      if (!b.bbox || b.type === "figure") continue;
+      const r = readRegion(glyphs, b.bbox, b.type);
+      const [got, want] = b.type === "table" ? [r.rows, b.rows] : b.type === "formula" ? [r.latex, b.latex] : [r.text, b.text];
+      if (JSON.stringify(got) === JSON.stringify(want)) { reread++; continue; }
+      failures++;
+      console.error(`✗ ${name} ${b.id} read again as ${b.type}\n  extracted: ${JSON.stringify(want)}\n  re-read:   ${JSON.stringify(got)}`);
+    }
+  }
+  console.log(`✓ ${name} regions read again: ${reread} blocks`);
   const pyDoc = JSON.parse(readFileSync(join(dir, `${name}.json`), "utf8"));
   const md = same(`${name} markdown, math as LaTeX`, readFileSync(join(dir, `${name}.latex.md`), "utf8"), toMarkdown(pyDoc, { images: "none", math: "latex" }));
   const txt = same(`${name} text, math as LaTeX`, readFileSync(join(dir, `${name}.latex.txt`), "utf8"), toText(pyDoc, { math: "latex" }));
