@@ -2310,3 +2310,138 @@ export async function extractDocument(data, opts = {}) {
 export async function openPdf(data, password) {
   return pdfjsLib.getDocument({ data: new Uint8Array(data), password: password || undefined, isEvalSupported: false, fontExtraProperties: true }).promise;
 }
+
+// ---------------------------------------------------------------- reading a region again (layout editor)
+/**
+ * The glyphs of a page as the layout analysis sees them (visible, fractions and roots put
+ * back on the line), for the layout editor to read again whatever region the user draws.
+ * @returns {Promise<{chars: object[], rotated: object[], fonts: object[], width: number, height: number, graphics: object}>}
+ */
+export async function pageGlyphs(pdf, number) {
+  const tex = isTexProducer((await readMetadata(pdf)).producer);
+  const page = await pdf.getPage(number);
+  const viewport = page.getViewport({ scale: 1, rotation: 0 });
+  const width = viewport.width, height = viewport.height;
+  const ops = await page.getOperatorList();
+  const g = await readGraphics(page, viewport, width, height, ops);
+  let { chars, rotated, fonts } = readGlyphs(page, viewport, ops, tex);
+  if (!chars.length && !rotated.length) ({ chars, rotated, fonts } = await readChars(page, viewport, await page.getTextContent()));
+  chars = typesetMath(visibleOnly(chars, g), g);
+  rotated = visibleOnly(rotated, g);
+  return { chars, rotated, fonts, width, height, graphics: g };
+}
+
+/**
+ * What a region of the page holds, read as a block of `type` — the same way the extraction
+ * reads it: `{ text, rows?, latex?, number?, marker?, runs? }`. A glyph belongs to the region
+ * when its centre does.
+ */
+export function readRegion(glyphs, bbox, type) {
+  const [x0, y0, x1, y1] = bbox;
+  const inBox = (c) => {
+    const cx = (c.x0 + c.x1) / 2, cy = (c.y0 + c.y1) / 2;
+    return cx >= x0 - 0.5 && cx <= x1 + 0.5 && cy >= y0 - 0.5 && cy <= y1 + 0.5;
+  };
+  const chars = glyphs.chars.filter(inBox);
+  const spans = chars.length ? buildSpans(chars, glyphs.fonts) : [];
+  if (type === "figure") {
+    // The words printed in a picture: its labels, the rotated ones too.
+    const rotated = groupRotated(glyphs.rotated.filter(inBox)).map((grp) => new Span(grp, glyphs.fonts, true));
+    return { text: [...spans, ...rotated].map((s) => s.text.trim()).filter(Boolean).join(NEWLINE) };
+  }
+  if (!spans.length) return type === "table" ? { text: "", rows: [] } : { text: "" };
+  // The lines, top to bottom, each left to right.
+  const lines = bandsOf(spans.map((s) => atom("span", s.x0, s.y0, s.x1, s.y1, { span: s })))
+    .map((band) => new Line(band.map((a) => a.span).sort((a, b) => a.x0 - b.x0)));
+  if (type === "table") {
+    // Its rules first, as the extraction does (cells may wrap inside a ruled grid)…
+    let rows = null;
+    if (glyphs.graphics) {
+      const near = (v, a, b) => v >= a - 2 && v <= b + 2;
+      const g = {
+        ...glyphs.graphics,
+        hrules: glyphs.graphics.hrules.filter(([y, a, b]) => near(y, y0, y1) && Math.min(b, x1) - Math.max(a, x0) > 0),
+        vrules: glyphs.graphics.vrules.filter(([x, a, b]) => near(x, x0, x1) && Math.min(b, y1) - Math.max(a, y0) > 0),
+      };
+      const [found] = detectRuledTables(spans, g);
+      const best = found.sort((a, b) => area(b.bbox) - area(a.bbox))[0];
+      if (best) rows = best.rows;
+    }
+    // …otherwise its lines: a line with a single piece continues the row above it.
+    if (!rows) {
+      const bands = bandsOf(spans.map((s) => atom("span", s.x0, s.y0, s.x1, s.y1, { span: s })));
+      const left = Math.min(...spans.map((s) => s.x0)), right = Math.max(...spans.map((s) => s.x1));
+      const edges = [Math.min(...bands[0].map((a) => a.y0))];
+      for (let k = 1; k < bands.length; k++)
+        if (bands[k].length >= 2) edges.push((Math.max(...bands[k - 1].map((a) => a.y1)) + Math.min(...bands[k].map((a) => a.y0))) / 2);
+      edges.push(Math.max(...bands[bands.length - 1].map((a) => a.y1)));
+      rows = gridRows(spans.flatMap(wordsOf), projectionColumns(spans, left, right), edges);
+    }
+    if (!rows.length) rows = lines.map((l) => [l.text]);
+    return { text: rows.map((r) => r.map((c) => c.replace(/\n/g, " ")).join(" | ")).join("\n"), rows };
+  }
+  if (type === "formula") {
+    let segs = [], number = null;
+    for (const ln of lines) {
+      const parts = [...ln.spans];
+      if (parts.length > 1 && EQ_NUMBER.test(parts[parts.length - 1].text.trim())) number = parts.pop().text.trim();
+      if (!parts.length) continue;
+      if (segs.length) segs.push(["n", " "]);
+      segs = segs.concat(new Line(parts).segments);
+    }
+    return { text: segmentsText(segs).trim(), latex: segmentsLatex(segs), number };
+  }
+  if (type === "code") {
+    const left = Math.min(...lines.map((l) => l.x0));
+    const size = median(lines.map((l) => l.size));
+    return { text: lines.map((l) => " ".repeat(Math.max(0, Math.round((l.x0 - left) / Math.max(size * 0.6, 1)))) + l.text).join("\n") };
+  }
+  // Where a line could have gone on is measured against the rest of its column, as when the
+  // page was read: three short centred lines are three lines, not one sentence.
+  const column = pageLines(glyphs).filter((l) => {
+    const cx = (l.x0 + l.x1) / 2, cy = (l.y0 + l.y1) / 2;
+    const within = cx >= x0 && cx <= x1 && cy >= y0 && cy <= y1;
+    return !within && Math.min(l.x1, x1) - Math.max(l.x0, x0) > 0;
+  });
+  const all = [...column, ...lines].sort((a, b) => a.y0 - b.y0);
+  const edges = all.length > 1 ? rightEdges(all) : new Map();
+  const out = { text: joinLines(lines, edges) };
+  let runs = runsOf(lines, edges);
+  if (type === "list_item") {
+    out.marker = listStart(out.text);
+    if (out.marker) {
+      out.text = out.text.trimStart().slice(out.marker.length).trim();
+      runs = stripPrefix(runs, out.marker);
+    }
+  }
+  if (runs.length > 1 || (runs.length && (runs[0].bold || runs[0].italic || runs[0].script))) out.runs = runs;
+  return out;
+}
+
+// Every line of the page, each run of text on a row on its own (two columns: two lines).
+function pageLines(glyphs) {
+  if (!glyphs.lines) {
+    const spans = glyphs.chars.length ? buildSpans(glyphs.chars, glyphs.fonts) : [];
+    glyphs.lines = bandsOf(spans.map((s) => atom("span", s.x0, s.y0, s.x1, s.y1, { span: s }))).flatMap((band) => {
+      const row = band.map((a) => a.span).sort((a, b) => a.x0 - b.x0);
+      const groups = [[row[0]]];
+      for (const sp of row.slice(1)) {
+        const last = groups[groups.length - 1];
+        if (sp.x0 - last[last.length - 1].x1 > Math.max(sp.size, 4) * 2) groups.push([sp]);
+        else last.push(sp);
+      }
+      return groups.map((g) => new Line(g));
+    });
+  }
+  return glyphs.lines;
+}
+
+/** A PNG crop of a region of a page (2× its size in points), for a block the editor changed. */
+export async function cropRegion(pdf, number, bbox, scale = 2) {
+  if (typeof document === "undefined") return null;
+  const page = await pdf.getPage(number);
+  const { canvas } = await drawPage(page, scale);
+  const crop = cropOf(canvas, { bbox }, scale);
+  canvas.width = canvas.height = 0;
+  return crop;
+}
