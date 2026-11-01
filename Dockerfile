@@ -1,5 +1,5 @@
 # ---- build: wheels for the app and its dependencies ----
-FROM python:3.12-slim AS build
+FROM python:3.15-slim AS build
 WORKDIR /src
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 COPY pyproject.toml README.md LICENSE ./
@@ -8,7 +8,7 @@ COPY web ./web
 RUN pip wheel --wheel-dir /wheels ".[api]"
 
 # ---- runtime: Python + Java (Tika Server) + Tesseract (OCR), non-root ----
-FROM python:3.12-slim
+FROM python:3.15-slim
 ARG TIKA_VERSION=3.3.2
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
